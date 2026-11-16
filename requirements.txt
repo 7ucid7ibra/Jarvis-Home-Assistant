@@ -1,0 +1,12 @@
+PyQt6
+sounddevice
+numpy<2
+faster-whisper
+pyttsx3
+requests
+piper-tts
+psutil
+keyring
+pathvalidate
+
+openwakeword

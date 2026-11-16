@@ -1,0 +1,1868 @@
+import sys
+import os
+import subprocess
+from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtCore import QThread, QObject, pyqtSignal, QTimer
+
+from ..ui.gui import MainWindow, MicButton
+from ..integrations.conversation import Conversation
+from ..audio.audio_io import AudioRecorder
+from ..audio.stt import STTWorker
+from ..providers.llm_client import LLMWorker
+from ..audio.tts import TTSWorker
+from ..integrations.ha_client import HomeAssistantClient
+from ..integrations.memory import MemoryManager
+from ..core.app_paths import profiles_history_file, profiles_memory_file
+from ..intelligence.intent_utils import (
+    parse_delay_seconds,
+    is_multi_domain_request,
+    state_matches_action,
+)
+from ..core.config import cfg
+from ..core.utils import logger, extract_json
+from ..application import (
+    AssistantService,
+    HomeAssistantActionService,
+    IntentRequestService,
+    IntentPromptBuilder,
+    IntentResponseParser,
+    MemoryService,
+    PendingActionService,
+    TaskSchedulingService,
+)
+from ..infrastructure.conversation_adapter import LegacyConversationAdapter
+from ..infrastructure.home_assistant_adapter import LegacyHomeAssistantAdapter
+from ..infrastructure.llm_request_adapter import QtLLMRequestAdapter
+from ..infrastructure.memory_adapter import LegacyMemoryAdapter
+from ..infrastructure.telegram_adapter import TelegramBotAdapter
+from ..infrastructure.qt_task_scheduler import QtTaskScheduler
+from ..infrastructure.web_search_adapter import DuckDuckGoWebSearchAdapter
+import json
+import time
+from datetime import datetime
+from typing import Any
+import re
+import unicodedata
+
+from ..intelligence.agents import IntentAgent, ActionAgent, ResponseAgent
+from ..intelligence.quick_commands import (
+    FastIntentRouter,
+    QuickCommand,
+    QuickCommandStore,
+    is_safe_auto_action,
+    new_quick_command_id,
+)
+
+
+QC_FILLER_PREFIX_TOKENS = {"bitte", "schalte", "mach", "please", "turn", "switch"}
+QC_ACTION_TOKENS = {"an", "on", "ein", "aus", "off"}
+
+
+class JarvisController(QObject):
+    # Signals to drive workers
+    request_stt = pyqtSignal(object)
+    request_llm = pyqtSignal(list, str)
+    request_tts = pyqtSignal(str)
+    request_tts_ack = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        self.app = QApplication(sys.argv)
+        self.window = MainWindow()
+        self.window.controller = self # Inject ref for settings
+        self.conversation = Conversation()
+        self.assistant_service = AssistantService(
+            LegacyConversationAdapter(self.conversation)
+        )
+        self.intent_prompt_builder = IntentPromptBuilder(
+            IntentAgent().get_system_prompt
+        )
+        self.intent_response_parser = IntentResponseParser()
+        self.llm_requester = QtLLMRequestAdapter(self.request_llm)
+        self.intent_request_service = IntentRequestService(
+            self.intent_prompt_builder,
+            self.llm_requester,
+        )
+        self.ha_client = HomeAssistantClient()
+        self.home_assistant = LegacyHomeAssistantAdapter(self.ha_client)
+        self.home_assistant_actions = HomeAssistantActionService(self.home_assistant)
+        self.web_search = DuckDuckGoWebSearchAdapter(
+            enabled=lambda: cfg.web_search_enabled
+        )
+        self.telegram = TelegramBotAdapter(
+            credentials=lambda: (cfg.telegram_bot_token, cfg.telegram_chat_id)
+        )
+        self.task_scheduling = TaskSchedulingService(QtTaskScheduler(self))
+        self.ha_entities = ""
+        QTimer.singleShot(500, self._async_load_ha_entities)
+        
+
+        
+        # Components
+        self.audio_recorder = AudioRecorder()
+        self.stt_worker = STTWorker()
+        self.llm_worker = LLMWorker()
+        self.tts_worker = TTSWorker()
+        
+        # Profile-aware initialization
+        self.init_profile_data()
+
+        # Threads
+        self.stt_thread = QThread()
+        self.llm_thread = QThread()
+        self.tts_thread = QThread()
+
+        # Move workers
+        self.stt_worker.moveToThread(self.stt_thread)
+        self.llm_worker.moveToThread(self.llm_thread)
+        self.tts_worker.moveToThread(self.tts_thread)
+
+        # Connect Driver Signals to Worker Slots
+        self.request_stt.connect(self.stt_worker.transcribe)
+        self.request_llm.connect(self.llm_worker.generate)
+        self.request_tts.connect(self.tts_worker.speak)
+        self.request_tts_ack.connect(self.tts_worker.speak_ack)
+
+        # Connect Worker Signals to Controller Slots
+        self.audio_recorder.finished.connect(self.handle_recording_finished)
+        self.audio_recorder.wake_word_detected.connect(self.handle_wake_word_detected)
+        self.audio_recorder.wake_word_error.connect(self.handle_wake_word_error)
+        self.audio_recorder.wake_word_status.connect(self.handle_wake_word_status)
+        self.stt_worker.finished.connect(self.handle_stt_finished)
+        self.stt_worker.error.connect(self.handle_error)
+
+        self.llm_worker.finished.connect(self.handle_llm_response)
+        self.llm_worker.error.connect(self.handle_error)
+
+        self.tts_worker.started.connect(self.handle_tts_started)
+        self.tts_worker.finished.connect(self.handle_tts_finished)
+
+        # UI Signals
+        self.window.mic_btn.clicked.connect(self.handle_mic_click)
+        self.window.chat_input.returnPressed.connect(self.handle_text_input)
+
+        # Start Threads
+        self.stt_thread.start()
+        self.llm_thread.start()
+        self.tts_thread.start()
+
+        # Load conversation into UI
+        # Load conversation into UI
+        self.window.clear_chat()
+        for msg in self.conversation.messages:
+            self.window.add_message(msg.content, msg.role == "user")
+
+        self.window.set_status("Idle")
+        
+        self.pending_action = None
+        self.current_state = "idle"
+        self._wake_word_active = False
+        self._ack_spoken = False
+        self._action_pending = False
+        self._ack_stage = None
+        self._ack_start_time = 0.0
+        self._ack_index = 0
+        self._ack_from_voice = False
+        self._ack_schedule = [2500]
+        self._ack_timer = QTimer(self)
+        self._ack_timer.setSingleShot(True)
+        self._ack_timer.timeout.connect(self._on_ack_timeout)
+        self._ignore_llm = False
+        self.current_time_context = ""
+        self._llm_timeout = QTimer(self)
+        self._llm_timeout.setSingleShot(True)
+        self._llm_timeout.timeout.connect(self._on_llm_timeout)
+        self._suppress_next_recording_finished = False
+        self._start_wake_word_if_enabled()
+
+    def _async_load_ha_entities(self):
+        self.ha_entities = self.ha_client.get_relevant_entities()
+        logger.info(f"Loaded HA Entities:\n{self.ha_entities}")
+
+    def _start_wake_word_if_enabled(self):
+        if not cfg.wake_word_enabled or self._wake_word_active:
+            return
+
+        started = self.audio_recorder.start_wake_word_listening(
+            keyword=cfg.wake_word,
+        )
+        self._wake_word_active = bool(started)
+        if started:
+            logger.info("Wake word ready. Say: Hey Jarvis")
+            if self.window.mic_btn.state == MicButton.STATE_IDLE:
+                self.window.set_status("Say: Hey Jarvis")
+        else:
+            self.window.set_status("Wake word unavailable; use mic button")
+
+    def _stop_wake_word_listening(self):
+        if self._wake_word_active:
+            self.audio_recorder.stop_wake_word_listening()
+            self._wake_word_active = False
+
+    def apply_runtime_settings(self) -> None:
+        """Apply updated config values to the live controller without restart."""
+        self.fast_intent_router = FastIntentRouter(
+            self.quick_commands,
+            fuzzy_enabled=cfg.quick_commands_fuzzy_enabled,
+        )
+
+        state = self.window.mic_btn.state
+        if not cfg.wake_word_enabled:
+            self._stop_wake_word_listening()
+            if state == MicButton.STATE_IDLE:
+                self.window.set_status("Idle")
+            return
+
+        if state in (MicButton.STATE_IDLE, MicButton.STATE_SPEAKING):
+            self._stop_wake_word_listening()
+            self._start_wake_word_if_enabled()
+
+    def init_profile_data(self):
+        profile = cfg.current_profile
+        logger.info(f"Initializing profile: {profile}")
+
+        mem_file = profiles_memory_file(profile)
+        hist_file = profiles_history_file(profile)
+
+        self.memory_manager = MemoryManager(memory_file=mem_file)
+        self.memory = LegacyMemoryAdapter(self.memory_manager)
+        self.memory_service = MemoryService(self.memory, clock=time.time)
+        self.pending_action_service = PendingActionService()
+        self.conversation = Conversation(history_file=hist_file)
+        self.conversation.load()
+
+        self.quick_command_store = QuickCommandStore(profile)
+        self.quick_commands = self.quick_command_store.load_commands()
+        self._normalize_existing_quick_commands()
+        self.fast_intent_router = FastIntentRouter(
+            self.quick_commands,
+            fuzzy_enabled=cfg.quick_commands_fuzzy_enabled,
+        )
+        
+    def switch_profile(self, new_profile):
+        if new_profile == cfg.current_profile:
+            return
+            
+        logger.info(f"Switching profile to: {new_profile}")
+        cfg.current_profile = new_profile
+        cfg.save()
+        
+        # Reload subsystems
+        self.init_profile_data()
+        
+        # Refresh UI
+        # Refresh UI
+        self.window.clear_chat()
+        for msg in self.conversation.messages:
+            self.window.add_message(msg.content, msg.role == "user")
+        
+        self.window.set_status(f"Profile: {new_profile}")
+        self.pending_action = None
+        self.window.show()
+
+    def run(self):
+        self.window.show()
+        sys.exit(self.app.exec())
+
+    def _helper_payload(self, helper_type: str, value):
+        """
+        Build payload for helper creation; keep defaults minimal to avoid errors.
+        """
+        if helper_type == "input_number":
+            payload = {"min": 0, "max": 100, "step": 1, "mode": "slider"}
+            if isinstance(value, (int, float)):
+                payload["initial"] = value
+            return payload
+        if helper_type == "input_text":
+            payload = {"max": 100}
+            if isinstance(value, str):
+                payload["initial"] = value
+            return payload
+        # input_boolean default
+        return {}
+
+    def _parse_entities(self) -> list[dict[str, str]]:
+        entities = []
+        for line in (self.ha_entities or "").splitlines():
+            line = line.strip()
+            match = re.match(r"- Name: '(.+?)', Entity: '(.+?)', State: '(.+?)'$", line)
+            if not match:
+                continue
+            name, entity_id, state = match.groups()
+            domain = entity_id.split(".")[0] if "." in entity_id else ""
+            entities.append(
+                {
+                    "name": name,
+                    "entity_id": entity_id,
+                    "state": state,
+                    "domain": domain,
+                }
+            )
+        return entities
+
+    def _save_quick_commands(self) -> None:
+        self.quick_command_store.save_commands(self.quick_commands)
+        self.fast_intent_router = FastIntentRouter(
+            self.quick_commands,
+            fuzzy_enabled=cfg.quick_commands_fuzzy_enabled,
+        )
+
+    def list_quick_commands(self) -> list[dict]:
+        return [c.to_dict() for c in self.quick_commands]
+
+    def _normalize_quick_phrase_text(self, text: str) -> str:
+        cleaned = re.sub(r"[^\w\s]", " ", (text or "").lower(), flags=re.UNICODE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    def _extract_quick_base_alias(self, phrase: str) -> str:
+        normalized = self._normalize_quick_phrase_text(phrase)
+        if not normalized:
+            return ""
+        tokens = normalized.split(" ")
+        if not tokens:
+            return ""
+
+        while tokens and tokens[0] in QC_FILLER_PREFIX_TOKENS:
+            tokens.pop(0)
+        while tokens and tokens[0] in QC_ACTION_TOKENS:
+            tokens.pop(0)
+        while tokens and tokens[0] in QC_FILLER_PREFIX_TOKENS:
+            tokens.pop(0)
+        while tokens and tokens[-1] in QC_ACTION_TOKENS:
+            tokens.pop()
+
+        return " ".join(tokens).strip()
+
+    def _build_canonical_quick_phrases(self, base_aliases: list[str]) -> tuple[list[str], list[str]]:
+        on_phrases: list[str] = []
+        off_phrases: list[str] = []
+        on_seen: set[str] = set()
+        off_seen: set[str] = set()
+
+        for base in base_aliases:
+            base_norm = self._extract_quick_base_alias(base)
+            if not base_norm:
+                continue
+
+            for phrase in (f"{base_norm} an", f"{base_norm} on"):
+                if phrase not in on_seen:
+                    on_seen.add(phrase)
+                    on_phrases.append(phrase)
+
+            for phrase in (f"{base_norm} aus", f"{base_norm} off"):
+                if phrase not in off_seen:
+                    off_seen.add(phrase)
+                    off_phrases.append(phrase)
+
+        return on_phrases, off_phrases
+
+    def _normalize_existing_quick_commands(self) -> None:
+        if not self.quick_commands:
+            return
+
+        grouped: dict[tuple[str, str], dict[str, QuickCommand | None]] = {}
+        for cmd in self.quick_commands:
+            action = cmd.action or {}
+            entity_id = str(action.get("entity_id") or "").strip()
+            service = str(action.get("service") or "").strip().lower()
+            domain = str(action.get("domain") or "").strip().lower()
+            if not entity_id or service not in {"turn_on", "turn_off"}:
+                continue
+            if not domain and "." in entity_id:
+                domain = entity_id.split(".", 1)[0].strip().lower()
+            if not domain:
+                continue
+
+            key = (domain, entity_id)
+            if key not in grouped:
+                grouped[key] = {"turn_on": None, "turn_off": None}
+            if grouped[key].get(service) is None:
+                grouped[key][service] = cmd
+
+        if not grouped:
+            return
+
+        changed = False
+        normalized_commands = 0
+        created_counterparts = 0
+
+        for (domain, entity_id), pair in grouped.items():
+            base_aliases: list[str] = []
+            seen_bases: set[str] = set()
+
+            for existing in (pair.get("turn_on"), pair.get("turn_off")):
+                if not existing:
+                    continue
+                for phrase in existing.phrases:
+                    base = self._extract_quick_base_alias(phrase)
+                    if base and base not in seen_bases:
+                        seen_bases.add(base)
+                        base_aliases.append(base)
+
+            if not base_aliases:
+                fallback_seed = entity_id.split(".", 1)[-1].replace("_", " ")
+                fallback = self._extract_quick_base_alias(fallback_seed)
+                if fallback:
+                    base_aliases.append(fallback)
+
+            if not base_aliases:
+                continue
+
+            on_phrases, off_phrases = self._build_canonical_quick_phrases(base_aliases)
+            if not on_phrases or not off_phrases:
+                continue
+
+            template = pair.get("turn_on") or pair.get("turn_off")
+            for service, service_phrases in (("turn_on", on_phrases), ("turn_off", off_phrases)):
+                action = {"domain": domain, "service": service, "entity_id": entity_id}
+                safety = "safe_auto" if is_safe_auto_action(action) else "requires_confirm"
+                existing = pair.get(service)
+
+                if existing is None:
+                    new_cmd = QuickCommand(
+                        id=new_quick_command_id(f"{entity_id}_{service}"),
+                        phrases=list(service_phrases),
+                        action=action,
+                        safety=safety,
+                        enabled=template.enabled if template else True,
+                        meta=dict(template.meta or {}) if template else {},
+                    )
+                    self.quick_commands.append(new_cmd)
+                    pair[service] = new_cmd
+                    changed = True
+                    normalized_commands += 1
+                    created_counterparts += 1
+                    continue
+
+                existing_changed = (
+                    existing.phrases != service_phrases
+                    or existing.action != action
+                    or existing.safety != safety
+                )
+                if existing_changed:
+                    existing.phrases = list(service_phrases)
+                    existing.action = action
+                    existing.safety = safety
+                    changed = True
+                    normalized_commands += 1
+
+        if changed:
+            self._save_quick_commands()
+            logger.info(
+                "quick_commands_normalized profile=%s normalized=%s created_counterparts=%s",
+                cfg.current_profile,
+                normalized_commands,
+                created_counterparts,
+            )
+
+    def upsert_quick_command(
+        self,
+        *,
+        cmd_id: str | None,
+        phrases: list[str],
+        action: dict,
+        safety: str,
+        enabled: bool,
+        meta: dict | None = None,
+    ) -> dict:
+        clean_phrases = [p.strip() for p in phrases if p and p.strip()]
+        if not clean_phrases:
+            raise ValueError("At least one phrase is required.")
+        if not isinstance(action, dict) or not action.get("domain") or not action.get("service") or not action.get("entity_id"):
+            raise ValueError("Action must include domain, service, and entity_id.")
+
+        if not cmd_id:
+            cmd_id = new_quick_command_id(clean_phrases[0])
+
+        existing = next((c for c in self.quick_commands if c.id == cmd_id), None)
+        if existing is None:
+            self.quick_commands.append(
+                QuickCommand(
+                    id=cmd_id,
+                    phrases=clean_phrases,
+                    action=action,
+                    safety=safety,
+                    enabled=enabled,
+                    meta=meta or {},
+                )
+            )
+        else:
+            existing.phrases = clean_phrases
+            existing.action = action
+            existing.safety = safety
+            existing.enabled = enabled
+            existing.meta = meta or existing.meta
+
+        self._save_quick_commands()
+        return {"status": "success", "id": cmd_id}
+
+    def delete_quick_command(self, cmd_id: str) -> dict:
+        before = len(self.quick_commands)
+        self.quick_commands = [c for c in self.quick_commands if c.id != cmd_id]
+        if len(self.quick_commands) == before:
+            return {"status": "not_found"}
+        self._save_quick_commands()
+        return {"status": "success"}
+
+    def list_selectable_quick_entities(self, include_all: bool = False) -> list[dict]:
+        safe_domains = {"light", "switch", "input_boolean"}
+        entities = []
+        seen = set()
+        for ent in self._parse_entities():
+            entity_id = ent.get("entity_id", "")
+            domain = ent.get("domain", "")
+            if not entity_id or entity_id in seen:
+                continue
+            if not include_all and domain not in safe_domains:
+                continue
+            seen.add(entity_id)
+            entities.append(ent)
+        entities.sort(key=lambda e: (e.get("name", "").lower(), e.get("entity_id", "")))
+        return entities
+
+    def refresh_quick_command_entities(self, include_all: bool = False) -> dict:
+        try:
+            refreshed = self.ha_client.get_relevant_entities()
+            if refreshed:
+                self.ha_entities = refreshed
+            selectable = self.list_selectable_quick_entities(include_all=include_all)
+            logger.info(
+                "quick_entities_refresh success include_all=%s count=%s",
+                include_all,
+                len(selectable),
+            )
+            return {"status": "success", "entities": selectable, "count": len(selectable)}
+        except Exception as exc:
+            selectable = self.list_selectable_quick_entities(include_all=include_all)
+            logger.warning("quick_entities_refresh failed include_all=%s error=%s", include_all, exc)
+            return {
+                "status": "error",
+                "error": str(exc),
+                "entities": selectable,
+                "count": len(selectable),
+            }
+
+    def suggest_quick_phrases(self, entity: dict) -> list[str]:
+        name = str(entity.get("name") or "").strip().lower()
+        return [name] if name else []
+
+    def create_quick_commands_for_entity(
+        self,
+        entity_id: str,
+        phrases: list[str],
+        enabled: bool = True,
+    ) -> dict:
+        all_entities = self.list_selectable_quick_entities(include_all=True)
+        entity = next((e for e in all_entities if e.get("entity_id") == entity_id), None)
+        if entity is None:
+            return {"status": "error", "error": "Entity no longer available."}
+
+        base_aliases: list[str] = []
+        seen_bases: set[str] = set()
+        for phrase in phrases:
+            base = self._extract_quick_base_alias(phrase)
+            if not base or base in seen_bases:
+                continue
+            seen_bases.add(base)
+            base_aliases.append(base)
+
+        if not base_aliases:
+            return {"status": "error", "error": "At least one phrase is required."}
+
+        on_phrases, off_phrases = self._build_canonical_quick_phrases(base_aliases)
+        if not on_phrases or not off_phrases:
+            return {"status": "error", "error": "No usable phrases generated."}
+
+        domain = entity.get("domain") or ""
+        action_keys = ["turn_on", "turn_off"]
+
+        by_action = {
+            (
+                cmd.action.get("domain"),
+                cmd.action.get("service"),
+                cmd.action.get("entity_id"),
+            ): cmd
+            for cmd in self.quick_commands
+        }
+
+        created = 0
+        updated = 0
+        for service in action_keys:
+            key = (domain, service, entity_id)
+            action = {"domain": domain, "service": service, "entity_id": entity_id}
+            safety = "safe_auto" if is_safe_auto_action(action) else "requires_confirm"
+            service_phrases = on_phrases if service == "turn_on" else off_phrases
+
+            existing = by_action.get(key)
+            if existing is None:
+                self.quick_commands.append(
+                    QuickCommand(
+                        id=new_quick_command_id(f"{entity_id}_{service}"),
+                        phrases=list(service_phrases),
+                        action=action,
+                        safety=safety,
+                        enabled=enabled,
+                        meta={"source": "device_picker"},
+                    )
+                )
+                created += 1
+            else:
+                existing.phrases = list(service_phrases)
+                existing.safety = safety
+                existing.enabled = enabled
+                existing.meta = {**(existing.meta or {}), "source": "device_picker"}
+                updated += 1
+
+        self._save_quick_commands()
+        phrase_count = len(on_phrases) + len(off_phrases)
+        logger.info(
+            "quick_commands_create_for_entity entity_id=%s created=%s updated=%s on_phrases=%s off_phrases=%s",
+            entity_id,
+            created,
+            updated,
+            len(on_phrases),
+            len(off_phrases),
+        )
+        return {
+            "status": "success",
+            "created": created,
+            "updated": updated,
+            "phrase_count": phrase_count,
+        }
+
+    def _run_fast_intent(self, user_text: str) -> bool:
+        if not cfg.quick_commands_enabled:
+            logger.info("Fast intent disabled; falling back to LLM")
+            return False
+
+        # Apply fuzzy setting live without requiring restart.
+        self.fast_intent_router = FastIntentRouter(
+            self.quick_commands,
+            fuzzy_enabled=cfg.quick_commands_fuzzy_enabled,
+        )
+        result = self.fast_intent_router.match_fast_intent(
+            user_text,
+            locale=cfg.language,
+            now_ctx=datetime.now(),
+        )
+        if result is None:
+            logger.info("fast_path=miss -> llm_fallback")
+            return False
+
+        if result.kind == "builtin_time":
+            logger.info("fast_path=builtin_time")
+            self._reply_direct(result.response_text or "")
+            return True
+
+        if result.kind == "quick_command_create":
+            target = str(result.meta.get("target") or "").strip()
+            if not target:
+                return False
+            candidates = [e for e in self._parse_entities() if target in e["name"].lower() or target in e["entity_id"].lower()]
+            if not candidates:
+                if cfg.language == "de":
+                    self._reply_direct("Ich habe kein passendes Geraet fuer diesen Schnellbefehl gefunden.")
+                else:
+                    self._reply_direct("I could not find a matching device for that quick command.")
+                return True
+            ent = candidates[0]
+            phrase = target
+            action = {"domain": ent["domain"], "service": "toggle", "entity_id": ent["entity_id"]}
+            self.upsert_quick_command(
+                cmd_id=None,
+                phrases=[phrase, f"toggle {phrase}", f"schalte {phrase}"],
+                action=action,
+                safety="safe_auto" if is_safe_auto_action(action) else "requires_confirm",
+                enabled=True,
+                meta={"source": "voice_create"},
+            )
+            if cfg.language == "de":
+                self._reply_direct(f"Schnellbefehl fuer {ent['name']} wurde erstellt.")
+            else:
+                self._reply_direct(f"Created quick command for {ent['name']}.")
+            return True
+
+        if result.kind == "quick_command_remove":
+            target = str(result.meta.get("target") or "").strip().lower()
+            if not target:
+                return False
+            match = None
+            for cmd in self.quick_commands:
+                if any(target == p.lower().strip() for p in cmd.phrases):
+                    match = cmd
+                    break
+            if match is None:
+                if cfg.language == "de":
+                    self._reply_direct("Kein passender Schnellbefehl gefunden.")
+                else:
+                    self._reply_direct("No matching quick command found.")
+                return True
+            self.delete_quick_command(match.id)
+            if cfg.language == "de":
+                self._reply_direct("Schnellbefehl entfernt.")
+            else:
+                self._reply_direct("Quick command removed.")
+            return True
+
+        if result.kind == "quick_action" and result.action:
+            cmd = result.quick_command
+            if result.requires_confirm:
+                self.pending_action = {
+                    "action": "quick_execute",
+                    "quick_command_id": cmd.id if cmd else None,
+                    "quick_command_phrase": (cmd.phrases[0] if cmd and cmd.phrases else "quick command"),
+                    "ha_action": result.action,
+                }
+                if cfg.language == "de":
+                    self._reply_direct("Soll ich den Schnellbefehl jetzt ausfuehren?")
+                else:
+                    self._reply_direct("Should I execute this quick command now?")
+                logger.info("fast_path=quick_confirm")
+                return True
+
+            execution = self._execute_action(result.action)
+            if execution.get("error"):
+                if cfg.language == "de":
+                    self._reply_direct("Schnellbefehl fehlgeschlagen.")
+                else:
+                    self._reply_direct("Quick command failed.")
+            else:
+                if cfg.language == "de":
+                    self._reply_direct("Erledigt.")
+                else:
+                    self._reply_direct("Done.")
+            logger.info("fast_path=quick_auto")
+            return True
+
+        return False
+
+    def _process_user_input(self, text: str) -> None:
+        if self.pending_action:
+            decision = self.pending_action_service.decide(text)
+            if decision == "confirm":
+                self.execute_pending_action()
+                return
+            if decision == "cancel":
+                self.pending_action = None
+                self.current_action_taken = {"action": "cancelled"}
+                self.start_response_agent()
+                return
+
+        text = self.assistant_service.begin_user_turn(text)
+        self.window.add_message(text, is_user=True)
+        QTimer.singleShot(0, lambda: self.window.scroll_area.verticalScrollBar().setValue(self.window.scroll_area.verticalScrollBar().maximum()))
+        self.window.set_status("Thinking...")
+
+        if self._run_fast_intent(text):
+            return
+
+        self.start_processing(text)
+
+    def _record_assistant_message(self, text: str) -> str:
+        """Persist assistant output through the application boundary."""
+        return self.assistant_service.complete_assistant_turn(text)
+
+    def _build_input_number_action(self) -> dict | None:
+        text = (self.current_user_text or "").lower()
+        value = None
+        match = re.search(r"(-?\d+(?:\.\d+)?)", text)
+        if match:
+            raw = match.group(1)
+            value = float(raw)
+            if value.is_integer():
+                value = int(value)
+        else:
+            if any(tok in text for tok in ["off", "aus", "zero", "null"]):
+                value = 0
+        relative_delta = None
+        if value is None:
+            if any(tok in text for tok in ["down", "lower", "less", "decrease", "runter", "weniger"]):
+                relative_delta = -1
+            if any(tok in text for tok in ["up", "higher", "more", "increase", "rauf", "hoeher", "mehr"]):
+                relative_delta = 1
+            if any(tok in text for tok in ["a little", "slightly", "a bit", "bit", "etwas", "ein wenig"]):
+                if relative_delta is None:
+                    relative_delta = -1
+            if any(tok in text for tok in ["a lot", "much", "way down", "way up", "viel"]):
+                if relative_delta is None:
+                    relative_delta = -2
+
+        target_hint = ""
+        if isinstance(self.current_intent, dict):
+            target_hint = (self.current_intent.get("target") or "").lower()
+
+        entities = [e for e in self._parse_entities() if e["domain"] == "input_number"]
+        candidates = []
+        if target_hint:
+            for ent in entities:
+                if target_hint in ent["name"].lower() or target_hint in ent["entity_id"].lower():
+                    candidates.append(ent)
+        if not candidates and ("heater" in text or "heizung" in text):
+            for ent in entities:
+                name_lower = ent["name"].lower()
+                entity_lower = ent["entity_id"].lower()
+                if "heater" in name_lower or "heater" in entity_lower or "heizung" in name_lower or "heizung" in entity_lower:
+                    candidates.append(ent)
+        if not candidates and len(entities) == 1:
+            candidates = entities
+        if not candidates:
+            return None
+
+        if value is None and relative_delta is not None:
+            current_raw = candidates[0].get("state")
+            try:
+                current_val = float(current_raw)
+                value = current_val + relative_delta
+                if value.is_integer():
+                    value = int(value)
+            except Exception:
+                return None
+
+        if value is None:
+            return None
+
+        return {
+            "domain": "input_number",
+            "service": "set_value",
+            "entity_id": candidates[0]["entity_id"],
+            "value": value,
+        }
+
+    def _execute_action(self, action: dict) -> dict:
+        return self.home_assistant_actions.execute(action)
+
+    def _schedule_action(self, action: dict, delay_seconds: int) -> dict:
+        clean_action = {k: v for k, v in action.items() if k != "delay_seconds"}
+        def run_action():
+            result = self._execute_action(clean_action)
+            summary = self._summarize_scheduled_result(clean_action, result)
+            self._record_assistant_message(summary)
+            self.window.add_message(summary, is_user=False)
+            if cfg.tts_volume > 0.0:
+                QTimer.singleShot(0, lambda: self.request_tts.emit(summary))
+
+        self.task_scheduling.schedule_after(delay_seconds, run_action)
+        return {"scheduled": True, "delay_seconds": delay_seconds, "action": clean_action}
+
+    def _summarize_scheduled_result(self, action: dict, result: dict) -> str:
+        if result.get("error"):
+            return "Scheduled task failed."
+        if result.get("verified") is False:
+            final_states = result.get("final_states", {}) or {}
+            entity_id = action.get("entity_id")
+            if isinstance(entity_id, list):
+                state_bits = [f"{eid}: {final_states.get(eid, 'unknown')}" for eid in entity_id]
+                return f"Scheduled task ran, but state did not update in time ({', '.join(state_bits)})."
+            return f"Scheduled task ran, but {entity_id} is still '{final_states.get(entity_id, 'unknown')}'."
+        domain = action.get("domain")
+        service = action.get("service")
+        entity_id = action.get("entity_id")
+        if service == "set_value":
+            return f"Scheduled task completed: set {entity_id} to {action.get('value')}."
+        if service == "turn_on":
+            return f"Scheduled task completed: turned on {entity_id}."
+        if service == "turn_off":
+            return f"Scheduled task completed: turned off {entity_id}."
+        return f"Scheduled task completed for {domain}:{service} on {entity_id}."
+
+    def _summarize_action_result(self, action: dict) -> str:
+        if action.get("service") == "set_value":
+            return f"Set {action.get('entity_id')} to {action.get('value')}."
+        if action.get("service") == "turn_on":
+            return f"Turned on {action.get('entity_id')}."
+        if action.get("service") == "turn_off":
+            return f"Turned off {action.get('entity_id')}."
+        if action.get("service") == "toggle":
+            return f"Toggled {action.get('entity_id')}."
+        return "Action completed."
+
+    def _summarize_action_failure(self, action: dict) -> str:
+        if action.get("error"):
+            return f"Action failed. {action.get('error')}"
+        if action.get("verified") is False:
+            final_states = action.get("final_states", {}) or {}
+            entity_id = action.get("entity_id") or "the device"
+            if isinstance(entity_id, list):
+                state_bits = [f"{eid}: {final_states.get(eid, 'unknown')}" for eid in entity_id]
+                return f"I sent the command, but state did not update in time ({', '.join(state_bits)})."
+            return f"I sent the command, but {entity_id} is still '{final_states.get(entity_id, 'unknown')}'."
+        return "Action failed."
+
+    def _send_telegram_message(self, message: str) -> dict:
+        return self.telegram.send(message)
+
+    def _telegram_reply(self, status: dict) -> str:
+        is_de = cfg.language == "de"
+        if status.get("scheduled"):
+            delay = status.get("delay_seconds")
+            if delay:
+                return f"Telegram-Nachricht in {int(delay)} Sekunden eingeplant." if is_de else f"Scheduled the Telegram message in {int(delay)} seconds."
+            return "Telegram-Nachricht eingeplant." if is_de else "Scheduled the Telegram message."
+        if status.get("status") == "success":
+            return "Telegram-Nachricht gesendet." if is_de else "Sent the Telegram message."
+        error = status.get("error") or ("Telegram-Nachricht fehlgeschlagen." if is_de else "Telegram message failed.")
+        return f"Telegram-Nachricht fehlgeschlagen. {error}" if is_de else f"Telegram message failed. {error}"
+
+    def _web_search(self, query: str, max_results: int = 3) -> dict:
+        logger.info(f"Web search query: {query}")
+        return self.web_search.search(query, max_results)
+
+    def _parse_time_context(self) -> datetime:
+        raw = (self.current_time_context or "").strip()
+        if raw:
+            try:
+                return datetime.fromisoformat(raw)
+            except Exception:
+                pass
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S", "%H:%M"):
+                try:
+                    parsed = datetime.strptime(raw, fmt)
+                    if fmt.startswith("%H"):
+                        return datetime.now().replace(hour=parsed.hour, minute=parsed.minute, second=getattr(parsed, "second", 0), microsecond=0)
+                    return parsed
+                except Exception:
+                    continue
+        return datetime.now()
+
+    def _parse_delay_seconds(self, user_text: str) -> int:
+        return parse_delay_seconds(user_text, self._parse_time_context())
+
+    def _schedule_telegram_message(self, message: str, delay_seconds: int) -> dict:
+        def run_send():
+            result = self._send_telegram_message(message)
+            is_de = cfg.language == "de"
+            summary = "Geplante Telegram-Nachricht gesendet." if is_de else "Scheduled Telegram message sent."
+            if result.get("status") != "success":
+                summary = "Geplante Telegram-Nachricht fehlgeschlagen." if is_de else "Scheduled Telegram message failed."
+            self._record_assistant_message(summary)
+            self.window.add_message(summary, is_user=False)
+            if cfg.tts_volume > 0.0:
+                QTimer.singleShot(0, lambda: self.request_tts.emit(summary))
+
+        self.task_scheduling.schedule_after(delay_seconds, run_send)
+        return {"scheduled": True, "delay_seconds": delay_seconds, "type": "telegram_send"}
+
+    def _reply_direct(self, text: str):
+        self._clear_ack_cycle()
+        self._cancel_llm_timeout()
+        self.current_state = "idle"
+        logger.info(f"Assistant: {text}")
+        self._record_assistant_message(text)
+        self.window.add_message(text, is_user=False)
+        self.window.set_status("Speaking...")
+        QTimer.singleShot(0, lambda: self.request_tts.emit(text))
+
+    def _is_multi_domain_request(self, user_text: str) -> bool:
+        return is_multi_domain_request(user_text, self._parse_entities())
+
+    def execute_pending_action(self):
+        """Execute pending helper actions after explicit confirmation from user."""
+        if not self.pending_action:
+            return
+        action = self.pending_action.get("action")
+        direct_handled = False
+        try:
+            if action == "quick_execute":
+                ha_action = self.pending_action.get("ha_action") or {}
+                result = self._execute_action(ha_action)
+                if result.get("error"):
+                    self._reply_direct("Schnellbefehl fehlgeschlagen." if cfg.language == "de" else "Quick command failed.")
+                else:
+                    self._reply_direct("Erledigt." if cfg.language == "de" else "Done.")
+                direct_handled = True
+            elif action == "create_helper":
+                helper_type = self.pending_action.get("helper_type", "input_boolean")
+                helper_name = self.pending_action.get("helper_name", "New Helper")
+                helper_value = self.pending_action.get("helper_value")
+                created = self.ha_client.create_helper(
+                    helper_type,
+                    helper_name,
+                    self._helper_payload(helper_type, helper_value),
+                )
+                refreshed = self.ha_client.get_relevant_entities()
+                self.ha_entities = refreshed
+                self.current_action_taken = {"action": "create_helper", "result": created, "entities": refreshed}
+            elif action == "delete_helper":
+                entity_id = self.pending_action.get("entity_id")
+                deleted = self.ha_client.delete_entity(entity_id)
+                refreshed = self.ha_client.get_relevant_entities()
+                self.ha_entities = refreshed
+                self.current_action_taken = {"action": "delete_helper", "result": deleted, "entities": refreshed}
+            elif action == "add_todo":
+                title = self.pending_action.get("todo_title")
+                due = self.pending_action.get("todo_due")
+                added = self.ha_client.add_todo_item(cfg.todo_entity, title, due=due)
+                items = self.ha_client.list_todo_items(cfg.todo_entity)
+                self.current_action_taken = {"action": "add_todo", "result": added, "items": items}
+            elif action == "remove_todo":
+                title = self.pending_action.get("todo_title")
+                removed = self.ha_client.remove_todo_item(cfg.todo_entity, title)
+                items = self.ha_client.list_todo_items(cfg.todo_entity)
+                self.current_action_taken = {"action": "remove_todo", "result": removed, "items": items}
+        except Exception as e:
+            self.current_action_taken = {"error": str(e)}
+        finally:
+            self.pending_action = None
+            if not direct_handled:
+                self.start_response_agent()
+
+    def describe_capabilities(self) -> str:
+        """
+        Short, speech-friendly summary of what the assistant can do and how to use confirmations.
+        """
+        return (
+            "I am voice-first. I listen on your mics, transcribe locally, and talk back with system voices. "
+            "Home control: I can turn on, turn off, or toggle lights, switches, input_booleans, and other supported domains via Home Assistant. "
+            "Scheduling: I can run actions later if you say things like 'in 30 minutes'. "
+            "Time: I can read the current time from Home Assistant. "
+            "Messaging: I can send Telegram messages if you add a bot token and chat ID in settings. "
+            "Web search: I can look things up online when you ask me to search the web. "
+            "Discovery: say 'refresh devices' after adding hardware in Home Assistant and I'll pull the latest list. "
+            "Memory: you can tell me facts to remember or ask me to recall them. "
+            "Configuration changes like adding entities or starting config flows are guarded and require your confirmation; I'll summarize before anything risky."
+        )
+
+    def refresh_entities(self) -> dict[str, str]:
+        """
+        Re-fetch entities from Home Assistant for LLM context and return a brief status payload.
+        """
+        try:
+            self.window.set_status("Refreshing devices...")
+            entities = self.ha_client.get_relevant_entities()
+            self.ha_entities = entities
+            preview = entities.splitlines()[:5]
+            return {
+                "status": "success",
+                "entities_preview": "\n".join(preview) if preview else "No relevant devices found.",
+            }
+        except Exception as e:
+            logger.error(f"Failed to refresh HA entities: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def handle_mic_click(self):
+        # Cancel in-flight processing if user clicks while thinking
+        if self.window.mic_btn.state == MicButton.STATE_THINKING:
+            self._cancel_inflight("Cancelled")
+            return
+            
+        if self.window.mic_btn.state == MicButton.STATE_IDLE:
+            if not self.stt_worker.is_available():
+                self.window.set_status("STT Disabled (Whisper missing)")
+                return
+            self._stop_wake_word_listening()
+            self.window.mic_btn.set_state(MicButton.STATE_LISTENING)
+            self.window.set_status("Listening...")
+            self.audio_recorder.start_recording(mode=AudioRecorder.MODE_MANUAL)
+        elif self.window.mic_btn.state == MicButton.STATE_LISTENING:
+            self.window.set_status("Processing...")
+            self.audio_recorder.stop_recording(reason="manual_stop")
+        elif self.window.mic_btn.state == MicButton.STATE_SPEAKING:
+            # Stop TTS playback without starting recording
+            self.tts_worker.stop()
+            # Note: tts.stop() will emit finished signal which calls handle_tts_finished
+            # which will set state to IDLE, so we don't need to do it here
+
+    def handle_recording_finished(self, audio_data):
+        if self._suppress_next_recording_finished:
+            self._suppress_next_recording_finished = False
+            logger.info("Suppressed recording callback after wake interrupt.")
+            return
+
+        if len(audio_data) == 0:
+            self._clear_ack_cycle()
+            self.window.mic_btn.set_state(MicButton.STATE_IDLE)
+            self.window.set_status("Idle")
+            self._start_wake_word_if_enabled()
+            return
+        
+        self._begin_ack_cycle(source="voice")
+        self.current_state = "transcribe"
+        self.window.mic_btn.set_state(MicButton.STATE_THINKING)
+        self.window.set_status("Transcribing...")
+        # Keep wake detector active so "Hey Jarvis" can interrupt long processing stages.
+        self._start_wake_word_if_enabled()
+        self.request_stt.emit(audio_data)
+
+    def handle_text_input(self):
+        if self.current_state in ("transcribe", "intent", "action", "response"):
+            self.window.set_status("Please wait...")
+            return
+        text = self.window.chat_input.text().strip()
+        if not text:
+            return
+
+        self.window.chat_input.clear()
+        self._process_user_input(text)
+
+    def handle_stt_finished(self, text):
+        if not text:
+            self._clear_ack_cycle()
+            self.window.mic_btn.set_state(MicButton.STATE_IDLE)
+            self.window.set_status("Idle")
+            self._start_wake_word_if_enabled()
+            return
+
+        self._process_user_input(text)
+
+    def _play_listen_tone(self):
+        """Play a subtle cue tone when wake-word enters listening mode."""
+        try:
+            if sys.platform == "darwin":
+                sound_file = "/System/Library/Sounds/Tink.aiff"
+                if os.path.exists(sound_file):
+                    subprocess.Popen(["afplay", "-v", "0.12", sound_file])
+                    return
+            QApplication.beep()
+        except Exception as exc:
+            logger.debug(f"Listen tone playback failed: {exc}")
+
+    def handle_wake_word_detected(self, keyword: str):
+        if not cfg.wake_word_enabled:
+            logger.info("Wake word detected but feature is disabled; ignoring.")
+            return
+
+        state = self.window.mic_btn.state
+        logger.info(f"Wake word detected: {keyword} (state={state})")
+        self._stop_wake_word_listening()
+
+        # Hard interrupt: stop any active capture/playback and in-flight LLM pipeline.
+        if self.audio_recorder.recording:
+            self._suppress_next_recording_finished = True
+            self.audio_recorder.stop_recording(reason="wake_interrupt")
+
+        if state == MicButton.STATE_SPEAKING:
+            logger.info("Wake interrupt during speaking: stopping TTS.")
+            self.tts_worker.stop()
+
+        if self.current_state in ("intent", "action", "response") or state == MicButton.STATE_THINKING:
+            self._cancel_inflight("Wake interrupt")
+
+        self.window.mic_btn.set_state(MicButton.STATE_LISTENING)
+        self.window.set_status("Listening... (Speak now)")
+        self._play_listen_tone()
+        self.audio_recorder.start_recording(
+            mode=AudioRecorder.MODE_WAKE_COMMAND,
+            silence_timeout_sec=cfg.wake_record_silence_sec,
+            max_duration_sec=cfg.wake_record_max_sec,
+            vad_energy_threshold=cfg.wake_vad_energy_threshold,
+        )
+
+    def handle_wake_word_error(self, message: str):
+        logger.warning(message)
+        self._wake_word_active = False
+        if cfg.wake_word_enabled and self.window.mic_btn.state == MicButton.STATE_IDLE:
+            self.window.set_status("Wake word unavailable; use mic button")
+
+    def handle_wake_word_status(self, message: str):
+        logger.info(message)
+        if cfg.wake_word_enabled and self.window.mic_btn.state == MicButton.STATE_IDLE:
+            self.window.set_status("Say: Hey Jarvis")
+
+
+
+    def start_processing(self, user_text: str):
+        self._ignore_llm = False
+        self.window.chat_input.setEnabled(False)
+        self.current_time_context = self.ha_client.get_time_context()
+        self.window.set_status("Thinking (Intent)...")
+        self._action_pending = False
+        if not self._ack_from_voice:
+            self._begin_ack_cycle(source="text")
+        else:
+            self._start_ack_timer()
+        self._start_llm_timeout("intent")
+        
+        # Get history
+        history = self.conversation.get_ollama_messages()[-5:] # Last 5 messages
+        self.current_state = "intent"
+        self.current_user_text = user_text
+        memory_context = self.memory.get_all_context()
+        self.intent_request_service.submit(
+            history=history,
+            user_text=user_text,
+            entities_context=self.ha_entities,
+            memory_context=memory_context,
+            capabilities=self.describe_capabilities(),
+            time_context=self.current_time_context,
+        )
+        
+    def handle_llm_response(self, response: str):
+        if self._ignore_llm:
+            logger.info("Ignoring LLM response due to cancellation.")
+            return
+        logger.debug(f"handle_llm_response state={self.current_state} preview={response[:50]!r}")
+        logger.info(f"LLM Response ({self.current_state}): {response}")
+        
+        if self.current_state == "intent":
+            parsed_response = self.intent_response_parser.parse(
+                response,
+                user_text=self.current_user_text,
+                entities=self._parse_entities(),
+            )
+
+            if parsed_response.kind == "web_search":
+                tool_query = parsed_response.query
+                if tool_query:
+                    self._action_pending = True
+                    self.current_intent = {"intent": "web_search", "query": tool_query}
+                    result = self._web_search(tool_query)
+                    if result.get("status") == "success":
+                        self.current_action_taken = {
+                            "action": "web_search",
+                            "web_search_results": result.get("results", []),
+                            "query": result.get("query"),
+                        }
+                    else:
+                        self.current_action_taken = {
+                            "action": "web_search",
+                            "error": result.get("error") or "Search failed.",
+                        }
+                    self._maybe_schedule_short_ack()
+                    self.start_response_agent()
+                    return
+
+            if parsed_response.kind == "unsafe_control":
+                # If the user asked for device control but intent output is plain text,
+                # do not allow a fake "done" confirmation with no executed action.
+                is_de = cfg.language == "de"
+                reply = (
+                    "Ich konnte den Steuerbefehl nicht sicher ausfuehren. "
+                    "Bitte wiederhole ihn kurz, zum Beispiel: 'Schalte die Tischlampe aus.'"
+                ) if is_de else (
+                    "I could not safely execute that control command. "
+                    "Please repeat it clearly, for example: 'Turn off the table lamp.'"
+                )
+                logger.warning(
+                    "Rejected direct intent reply for control-like request without JSON intent."
+                )
+                self._reply_direct(reply)
+                return
+
+            if parsed_response.kind == "conversation":
+                # Direct conversation reply from IntentAgent
+                self._clear_ack_cycle()
+                self._cancel_llm_timeout()
+                reply = self._sanitize_reply(response)
+                logger.info(f"Assistant (direct): {reply}")
+                self._record_assistant_message(reply)
+                self.window.add_message(reply, is_user=False)
+
+                self.window.set_status("Speaking...")
+                QTimer.singleShot(0, lambda: self.request_tts.emit(reply))
+                self.current_state = "idle"
+                return
+
+            data = parsed_response.data
+            # JSON response - proceed with normal intent processing
+            try:
+                self.current_intent = data
+                logger.info(f"Parsed intent: {data.get('intent')}")
+
+                # Voice help intent
+                if data.get("intent") == "help":
+                    self._action_pending = False
+                    self.current_action_taken = {
+                        "action": "help",
+                        "capabilities": self.describe_capabilities(),
+                    }
+                    self._maybe_schedule_short_ack()
+                    self.start_response_agent()
+                    return
+
+                # Voice-triggered entity refresh
+                if data.get("intent") == "refresh_entities" or data.get("action") == "refresh":
+                    self._action_pending = True
+                    refresh_result = self.refresh_entities()
+                    self.current_action_taken = {"action": "refresh_entities", **refresh_result}
+                    self._maybe_schedule_short_ack()
+                    self.start_response_agent()
+                    return
+                
+                # Handle Memory Write Intent
+                if data.get("intent") == "memory_write" or (data.get("action") == "remember"):
+                    self._action_pending = False
+                    memory_result = self.memory_service.remember(self.current_user_text)
+                    if memory_result.stored:
+                        self.current_action_taken = {
+                            "action": "remember",
+                            "status": "success",
+                            "fact": memory_result.fact,
+                        }
+                        self._maybe_schedule_short_ack()
+                        self.start_response_agent()
+                        return
+                    else:
+                        logger.warning(f"Ignored invalid memory fact: '{fact}'")
+                        self.current_intent = {"intent": "conversation"}
+                        self.current_action_taken = None
+                        self._maybe_schedule_short_ack()
+                        self.start_response_agent()
+                        return
+
+                # Handle Memory Read Intent
+                if data.get("intent") == "memory_read":
+                    self._action_pending = False
+                    # Just pass through to ResponseAgent, but mark action as 'recall' so it knows to look in memory
+                    self.current_action_taken = {"action": "recall", "status": "success"}
+                    self._maybe_schedule_short_ack()
+                    self.start_response_agent()
+                    return
+
+                if data.get("intent") == "home_control":
+                    self._action_pending = True
+                    # 2. Action Agent
+                    self.window.set_status("Thinking (Action)...")
+                    self.current_state = "action"
+                    self._start_llm_timeout("action")
+                    
+                    action_agent = ActionAgent()
+                    messages = [{"role": "system", "content": action_agent.get_system_prompt(self.ha_entities, self.current_time_context)}]
+                    messages.append({"role": "user", "content": f"Intent: {json.dumps(data)}. User: {self.current_user_text}"})
+                    self._maybe_schedule_short_ack()
+                    self.llm_requester.request(messages, "json")
+                elif data.get("intent") == "telegram_send" or data.get("action") == "send_message":
+                    self._action_pending = True
+                    message = data.get("message") or self.current_user_text
+                    delay = self._parse_delay_seconds(self.current_user_text)
+                    if delay > 0:
+                        result = self._schedule_telegram_message(message, delay)
+                    else:
+                        result = self._send_telegram_message(message)
+                    self.current_action_taken = {"action": "telegram_send", **result}
+                    self._maybe_schedule_short_ack()
+                    self.start_response_agent()
+                elif data.get("intent") == "web_search":
+                    self._action_pending = True
+                    query = data.get("query") or self.current_user_text
+                    result = self._web_search(query)
+                    if result.get("status") == "success":
+                        self.current_action_taken = {"action": "web_search", "web_search_results": result.get("results", []), "query": result.get("query")}
+                    else:
+                        self.current_action_taken = {"action": "web_search", "error": result.get("error") or "Search failed."}
+                    self._maybe_schedule_short_ack()
+                    self.start_response_agent()
+                elif data.get("intent") == "helper_create":
+                    self._action_pending = True
+                    # Stage a confirmation; do not execute until user confirms
+                    helper_type = (data.get("helper_type") or "input_boolean").strip()
+                    helper_name = data.get("helper_name") or self.current_user_text.strip() or "New Helper"
+                    helper_value = data.get("helper_value")
+                    self.pending_action = {
+                        "pending": True,
+                        "action": "create_helper",
+                        "helper_type": helper_type,
+                        "helper_name": helper_name,
+                        "helper_value": helper_value,
+                        "message": f"Create {helper_type} named '{helper_name}'?"
+                    }
+                    self.current_action_taken = self.pending_action
+                    self._maybe_schedule_short_ack()
+                    self.start_response_agent()
+                elif data.get("intent") == "helper_delete":
+                    self._action_pending = True
+                    # Stage deletion confirmation
+                    target = data.get("target") or data.get("helper_name") or self.current_user_text.strip()
+                    self.pending_action = {
+                        "pending": True,
+                        "action": "delete_helper",
+                        "entity_id": target,
+                        "message": f"Delete helper/entity '{target}'?"
+                    }
+                    self.current_action_taken = self.pending_action
+                    self._maybe_schedule_short_ack()
+                    self.start_response_agent()
+                elif data.get("intent") == "todo_add":
+                    self._action_pending = True
+                    title = data.get("todo_title") or self.current_user_text
+                    due = data.get("todo_due")
+                    self.pending_action = {
+                        "pending": True,
+                        "action": "add_todo",
+                        "todo_title": title,
+                        "todo_due": due,
+                        "message": f"Add reminder '{title}'" + (f" due {due}" if due else "") + "?"
+                    }
+                    self.current_action_taken = self.pending_action
+                    self._maybe_schedule_short_ack()
+                    self.start_response_agent()
+                elif data.get("intent") == "todo_remove":
+                    self._action_pending = True
+                    title = data.get("todo_title") or self.current_user_text
+                    self.pending_action = {
+                        "pending": True,
+                        "action": "remove_todo",
+                        "todo_title": title,
+                        "message": f"Remove reminder '{title}'?"
+                    }
+                    self.current_action_taken = self.pending_action
+                    self._maybe_schedule_short_ack()
+                    self.start_response_agent()
+                else:
+                    logger.info(f"Unhandled intent falling through to conversation: {data}")
+                    self._action_pending = False
+                    # Skip to Response Agent
+                    self.current_action_taken = None
+                    self._maybe_schedule_short_ack()
+                    self.start_response_agent()
+                    
+            except Exception as e:
+                logger.error(f"Intent parsing failed: {e}")
+                self.current_intent = {"intent": "conversation"}
+                # Provide feedback instead of silent failure
+                self.current_action_taken = {"error": "I couldn't understand that command. Please rephrasing."}
+                self._maybe_schedule_short_ack()
+                self.start_response_agent()
+
+        elif self.current_state == "action":
+            try:
+                action_payload = extract_json(response) or {}
+                actions = []
+                if isinstance(action_payload, dict) and isinstance(action_payload.get("actions"), list):
+                    actions = [a for a in action_payload.get("actions") if isinstance(a, dict)]
+                elif isinstance(action_payload, dict) and action_payload:
+                    actions = [action_payload]
+
+                if not actions:
+                    fallback = self._build_input_number_action()
+                    if fallback:
+                        actions = [fallback]
+
+                normalized_actions = []
+                for action in actions:
+                    if not action or not action.get("service"):
+                        continue
+                    if action.get("domain") == "input_number" and action.get("service") in ["turn_on", "turn_off", "toggle"]:
+                        fallback = self._build_input_number_action()
+                        if fallback:
+                            action = fallback
+                    normalized_actions.append(action)
+
+                if normalized_actions:
+                    self.window.set_status("Executing...")
+                    results = []
+                    fallback_delay = self._parse_delay_seconds(self.current_user_text)
+                    for action in normalized_actions:
+                        delay = action.get("delay_seconds") or 0
+                        try:
+                            delay = int(float(delay))
+                        except Exception:
+                            delay = 0
+                        if delay == 0 and fallback_delay > 0:
+                            delay = fallback_delay
+
+                        if delay > 0:
+                            results.append(self._schedule_action(action, delay))
+                        else:
+                            results.append(self._execute_action(action))
+                    self.current_action_taken = {"actions": results}
+                else:
+                    self.current_action_taken = None
+            except Exception as e:
+                logger.error(f"Action parsing failed: {e}")
+                self.current_action_taken = None
+            
+            self.start_response_agent()
+
+        elif self.current_state == "response":
+            self._clear_ack_cycle()
+            self._cancel_llm_timeout()
+            # Final response
+            reply = self._sanitize_reply(response)
+            logger.info(f"Assistant: {reply}")
+            self._record_assistant_message(reply)
+            self.window.add_message(reply, is_user=False)
+            
+            self.window.set_status("Speaking...")
+            QTimer.singleShot(0, lambda: self.request_tts.emit(reply))
+            self.current_state = "idle"
+
+    def start_response_agent(self):
+        self.window.set_status("Thinking (Reply)...")
+        self.current_state = "response"
+        self._start_llm_timeout("response")
+
+        if isinstance(self.current_action_taken, dict) and self.current_action_taken.get("action") == "telegram_send":
+            self._reply_direct(self._telegram_reply(self.current_action_taken))
+            return
+
+        if isinstance(self.current_action_taken, dict):
+            if isinstance(self.current_action_taken.get("actions"), list):
+                failures = []
+                successes = []
+                for action in self.current_action_taken.get("actions", []):
+                    if action.get("error") or action.get("verified") is False:
+                        failures.append(action)
+                    elif action.get("verified") is True:
+                        successes.append(action)
+                if failures:
+                    parts = []
+                    for act in successes:
+                        parts.append(self._summarize_action_result(act))
+                    for act in failures:
+                        parts.append(self._summarize_action_failure(act))
+                    self._reply_direct(" ".join(parts))
+                    return
+            elif self.current_action_taken.get("error") or self.current_action_taken.get("verified") is False:
+                reply = self._summarize_action_failure(self.current_action_taken)
+                self._reply_direct(reply)
+                return
+        
+        # Get memory context
+        memory_context = self.memory.get_all_context()
+        
+        response_agent = ResponseAgent()
+        messages = [{"role": "system", "content": response_agent.get_system_prompt(
+            memory_context=memory_context,
+            entities_context=self.ha_entities,
+            capabilities=self.describe_capabilities(),
+            time_context=self.current_time_context
+        )}]
+        
+        # Add conversation history (last 10 messages)
+        history = self.conversation.get_ollama_messages()[-10:]
+        messages.extend(history)
+        
+        # Context for response
+        system_context = ""
+        if self.current_intent:
+            system_context += f"Intent: {self.current_intent.get('intent')}\n"
+        
+        # Only add action if it was actually attempted and has a result
+        if self.current_action_taken:
+            system_context += f"Action Result: {json.dumps(self.current_action_taken)}\n"
+        else:
+            system_context += "Action Result: None (No action was taken)\n"
+            
+        # Construct the final prompt with clear delimiters
+        final_prompt = (
+            f"System Context:\n{system_context}\n"
+            f"User Input:\n{self.current_user_text}"
+        )
+        
+        messages.append({"role": "user", "content": final_prompt})
+        
+        self.llm_requester.request(messages, "text")
+
+    def _begin_ack_cycle(self, anchor_ts: float | None = None, source: str = "text"):
+        self._ack_spoken = False
+        self._action_pending = False
+        self._ack_stage = None
+        self._ack_index = 0
+        self._ack_from_voice = source == "voice"
+        self._ack_start_time = anchor_ts or time.time()
+        self._start_ack_timer()
+
+    def _clear_ack_cycle(self):
+        self._cancel_ack_timer()
+        self._ack_spoken = False
+        self._action_pending = False
+        self._ack_stage = None
+        self._ack_index = 0
+        self._ack_start_time = 0.0
+        self._ack_from_voice = False
+
+    def _start_ack_timer(self):
+        if self._ack_timer.isActive():
+            self._ack_timer.stop()
+        if self._ack_index >= len(self._ack_schedule):
+            return
+        if self._ack_start_time <= 0:
+            return
+        elapsed_ms = int((time.time() - self._ack_start_time) * 1000)
+        target_ms = self._ack_schedule[self._ack_index]
+        remaining = max(0, target_ms - elapsed_ms)
+        self._ack_timer.start(remaining)
+
+    def _cancel_ack_timer(self):
+        if self._ack_timer.isActive():
+            self._ack_timer.stop()
+
+    def _on_ack_timeout(self):
+        if self.current_state not in ("transcribe", "intent", "action", "response"):
+            return
+        stage = self._stage_for_index(self._ack_index)
+        ack = self._pick_ack_phrase(stage=stage)
+        if not ack:
+            return
+        self._ack_spoken = True
+        self._ack_stage = stage
+        QTimer.singleShot(0, lambda: self.window.add_message(ack, is_user=False, animate=False))
+        try:
+            QTimer.singleShot(60, lambda: self.request_tts_ack.emit(ack))
+        except Exception as e:
+            logger.error(f"Ack TTS failed: {e}")
+        self._ack_index += 1
+        self._start_ack_timer()
+
+    def _stage_for_index(self, idx: int) -> str:
+        if idx == 0:
+            return "short"
+        if idx == 1:
+            return "long"
+        return "very_long"
+
+    def _maybe_schedule_short_ack(self):
+        if self._ack_index == 0:
+            self._start_ack_timer()
+
+    def _pick_ack_phrase(self, stage: str) -> str:
+        is_de = cfg.language == "de"
+        action_context = self._action_pending or self.current_state == "action"
+        if action_context:
+            if stage == "very_long":
+                options = [
+                    "Sorry for the wait. Still working on it.",
+                    "Apologies, this is taking longer than usual.",
+                    "Sorry, still handling that.",
+                    "Thanks for waiting. Still on it.",
+                    "I am still on it. Thank you for your patience.",
+                    "Still working on it. I will be with you shortly.",
+                ] if not is_de else [
+                    "Entschuldigung, das dauert laenger. Ich arbeite noch daran.",
+                    "Danke fuer deine Geduld. Ich bin noch dran.",
+                    "Es dauert etwas. Ich kuemmere mich noch darum.",
+                    "Sorry, ich arbeite noch daran.",
+                    "Ich bin weiterhin dran. Gleich fertig.",
+                ]
+            elif stage == "long":
+                options = [
+                    "Still on it.",
+                    "Just a moment longer.",
+                    "Working through that now.",
+                    "Almost there.",
+                    "Hang tight, nearly done.",
+                    "Still working on that.",
+                    "One more moment, I am on it.",
+                    "Still in progress, almost done.",
+                    "Holding steady, finishing up now.",
+                ] if not is_de else [
+                    "Ich bin dran.",
+                    "Einen Moment noch.",
+                    "Ich arbeite daran.",
+                    "Fast fertig.",
+                    "Ich bin noch dran.",
+                    "Ich bin gleich fertig.",
+                    "Noch einen kurzen Moment.",
+                ]
+            else:
+                options = [
+                    "Working on it.",
+                    "On it.",
+                    "Alright, handling that now.",
+                    "Got it, doing it now.",
+                    "Okay, one moment.",
+                    "Taking care of it.",
+                    "Starting that now.",
+                    "Doing that now.",
+                    "Understood, I am on it.",
+                    "Okay, I will handle that.",
+                ] if not is_de else [
+                    "Ich kuemmere mich darum.",
+                    "Alles klar, ich mache das.",
+                    "Verstanden, ich bin dran.",
+                    "In Ordnung, ich mache das jetzt.",
+                    "Okay, einen Moment.",
+                    "Ich erledige das.",
+                    "Ich starte das jetzt.",
+                ]
+        else:
+            if stage == "very_long":
+                options = [
+                    "Sorry for the wait. Still thinking.",
+                    "Apologies, this is taking a bit.",
+                    "Sorry, still working it out.",
+                    "Thanks for waiting. Still thinking.",
+                    "Sorry for the wait. Still working it out.",
+                    "Thanks for your patience. I am still thinking.",
+                ] if not is_de else [
+                    "Entschuldigung, das dauert laenger. Ich denke noch nach.",
+                    "Danke fuers Warten. Ich denke noch nach.",
+                    "Es dauert etwas. Ich denke noch.",
+                    "Sorry, ich ueberlege noch.",
+                    "Ich denke noch nach. Gleich soweit.",
+                ]
+            elif stage == "long":
+                options = [
+                    "Still thinking.",
+                    "Taking a little longer, hang on.",
+                    "One more moment.",
+                    "Give me a second longer.",
+                    "Thinking it through.",
+                    "Almost done, hang on.",
+                    "Just a bit longer.",
+                    "Let me think a moment longer.",
+                    "Still working it out, one moment.",
+                ] if not is_de else [
+                    "Ich denke noch nach.",
+                    "Einen Moment noch.",
+                    "Noch einen Moment.",
+                    "Ich ueberlege kurz.",
+                    "Ich denke das kurz durch.",
+                    "Gleich fertig.",
+                    "Nur einen Moment.",
+                ]
+            else:
+                options = [
+                    "Hmm, let me think.",
+                    "One moment.",
+                    "Let me check.",
+                    "Let me think for a second.",
+                    "Just a moment.",
+                    "Checking that now.",
+                    "Let me take a quick look.",
+                    "Let me have a quick look.",
+                    "Thinking for a moment.",
+                    "Give me a second to think.",
+                    "Let me think this through.",
+                    "I am thinking on that.",
+                    "Give me a moment.",
+                ] if not is_de else [
+                    "Hmm, einen Moment.",
+                    "Einen Moment.",
+                    "Lass mich kurz nachsehen.",
+                    "Ich denke kurz nach.",
+                    "Einen kurzen Moment.",
+                    "Ich schaue kurz nach.",
+                    "Ich ueberlege kurz.",
+                    "Ich denke kurz drueber nach.",
+                    "Gib mir einen Moment.",
+                ]
+        idx = int(time.time() * 1000) % len(options)
+        return options[idx]
+
+    def _sanitize_reply(self, text: str) -> str:
+        if not text:
+            return ""
+        cleaned = text.strip()
+        cleaned = unicodedata.normalize("NFKC", cleaned)
+        # Remove XML-like tool call blocks (e.g., minimax tool invocation markup).
+        cleaned = re.sub(
+            r"<minimax:tool_call>[\s\S]*?</minimax:tool_call>",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"<invoke[\s\S]*?</invoke>",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"<parameter[\s\S]*?</parameter>",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        # Remove fenced JSON command blocks that should never be spoken to the user.
+        cleaned = re.sub(
+            r"```(?:json)?\s*(\{[\s\S]*?\})\s*```",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        # Remove standalone "json" marker lines.
+        cleaned = re.sub(r"(?im)^\s*json\s*$", "", cleaned)
+        # Remove leaked inline command objects from model output.
+        cleaned = re.sub(
+            r"\{[^{}]*\"(?:intent|action|target|domain|service|entity_id)\"[^{}]*\}",
+            "",
+            cleaned,
+        )
+        # Remove common markdown markers without stripping content.
+        cleaned = cleaned.replace("**", "").replace("__", "").replace("`", "")
+        cleaned = re.sub(r"^#{1,6}\s*", "", cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r"^[-•]\s+", "", cleaned, flags=re.MULTILINE)
+        # Remove URLs to keep TTS conversational.
+        cleaned = re.sub(r"https?://\S+", "", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    def handle_tts_started(self):
+        self.window.mic_btn.set_state(MicButton.STATE_SPEAKING)
+        self._start_wake_word_if_enabled()
+
+    def handle_tts_finished(self):
+        if self.window.mic_btn.state == MicButton.STATE_LISTENING:
+            logger.info("TTS finished after wake interrupt; keeping listening state.")
+            return
+
+        self.window.mic_btn.set_state(MicButton.STATE_IDLE)
+        self.window.set_status("Idle")
+        self.window.chat_input.setEnabled(True)
+        self._start_wake_word_if_enabled()
+
+    def _handle_remote_ollama_unreachable(self, msg: str) -> bool:
+        prefix = f"{LLMWorker.REMOTE_UNREACHABLE_PREFIX}:"
+        if not isinstance(msg, str) or not msg.startswith(prefix):
+            return False
+
+        remote_url = msg[len(prefix):].strip()
+        choice = QMessageBox.question(
+            self.window,
+            "Remote Ollama Unreachable",
+            (
+                f"Remote Ollama is unreachable at\n{remote_url}\n\n"
+                "Switch to local Ollama (http://127.0.0.1:11434) for this session?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if choice == QMessageBox.StandardButton.Yes:
+            cfg.ollama_api_url = "http://127.0.0.1:11434"
+            self.window.set_status("Switched to local Ollama for this session")
+            logger.info("User accepted fallback to local Ollama endpoint")
+            return True
+
+        self.window.set_status("Remote Ollama unreachable")
+        return True
+
+    def handle_error(self, msg):
+        self._clear_ack_cycle()
+        self._cancel_llm_timeout()
+        if self._handle_remote_ollama_unreachable(msg):
+            return
+        self.window.set_status("Error")
+        self.window.add_message(f"Error: {msg}", is_user=False)
+        self.window.mic_btn.set_state(MicButton.STATE_IDLE)
+        self.window.chat_input.setEnabled(True)
+
+    def _cancel_inflight(self, reason: str):
+        self._ignore_llm = True
+        self._clear_ack_cycle()
+        self._cancel_llm_timeout()
+        self.current_state = "idle"
+        self.window.mic_btn.set_state(MicButton.STATE_IDLE)
+        self.window.set_status("Idle")
+        self.window.chat_input.setEnabled(True)
+
+    def _start_llm_timeout(self, stage: str):
+        if self._llm_timeout.isActive():
+            self._llm_timeout.stop()
+        # Shorter timeout for intent/action, longer for response.
+        if stage in ("intent", "action"):
+            self._llm_timeout.start(180000)
+        else:
+            self._llm_timeout.start(240000)
+
+    def _cancel_llm_timeout(self):
+        if self._llm_timeout.isActive():
+            self._llm_timeout.stop()
+
+    def _on_llm_timeout(self):
+        self._clear_ack_cycle()
+        self.window.set_status("Error")
+        self.window.add_message("Error: Response timed out. Please try again.", is_user=False)
+        self.window.mic_btn.set_state(MicButton.STATE_IDLE)
+        self.current_state = "idle"
+        self._start_wake_word_if_enabled()
+    
+def main():
+    controller = JarvisController()
+    controller.run()
+
+
+if __name__ == "__main__":
+    main()
